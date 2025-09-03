@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: shopify-hgi-mw
+    env: node
+    buildCommand: npm ci
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    plan: starter
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: SHOPIFY_SECRET
+        sync: false        
+      - key: HGI_USER
+        sync: false      
+      - key: HGI_PASS
+        sync: false       
+      - key: HGI_BASE_URL
+        value: "https://cloud2.hgi.com.co:9323/"
+      - key: HGI_COMPANY
+        value: "1"
+      - key: HGI_EMPRESA
+        value: "1"
+      - key: HGI_COMPROBANTE
+        value: "FV"
+      - key: HGI_CUENTA_INGRESO
+        value: "413505"
+      - key: HGI_CUENTA_CLIENTE
+        value: "130505"
+      - key: HGI_TERCERO_DEFAULT
+        value: "900123456"
+g

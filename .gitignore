@@ -1,0 +1,8 @@
+node_modules
+.env
+map.json
+.env
+.env.*
+!.env.example
+map.json
+node_modules/
