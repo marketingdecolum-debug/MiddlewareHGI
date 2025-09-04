@@ -30,4 +30,3 @@ services:
         value: "130505"
       - key: HGI_TERCERO_DEFAULT
         value: "900123456"
-g

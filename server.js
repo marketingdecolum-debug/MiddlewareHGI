@@ -1,32 +1,3 @@
-/**
- * Shopify ⇄ HGI ERP Middleware (Express)
- * ------------------------------------------------------------
- * - Recibe webhooks de Shopify (JSON) y verifica HMAC.
- * - Obtiene / renueva JWT de HGI y llama a los endpoints REST.
- * - Mapea: products/update, orders/paid, orders/cancelled.
- * - Guarda el mapeo orderId ⇄ {empresa, comprobante, documento} para anulación.
- *
- * Requisitos: Node 18+, npm i express axios dotenv
- *
- * .env (ejemplo)
- * ------------------------------------------------------------
- * PORT=3000
- *
- * # Shopify
- * SHOPIFY_SECRET=__TU_SHOPIFY_WEBHOOK_SECRET__
- *
- * # HGI
- * HGI_BASE_URL=https://cloud2.hgi.com.co:9323/
- * HGI_USER=__USUARIO__
- * HGI_PASS=__CLAVE__
- * HGI_COMPANY=1                # cod_compania
- * HGI_EMPRESA=1                # cod_empresa
- * HGI_COMPROBANTE=FV           # Id del comprobante de venta (p.ej. FV)
- * HGI_CUENTA_INGRESO=413505    # Cuenta contable ingresos (crédito)
- * HGI_CUENTA_CLIENTE=130505    # Cuenta por cobrar (débito)
- * HGI_TERCERO_DEFAULT=900123456  # (opcional) si no puedes mapear el tercero
- */
-
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
@@ -67,19 +38,14 @@ async function getHgiToken() {
   };
   const url = `${HGI_BASE_URL}Api/Autenticar`;
   const resp = await axios.get(url, { params, timeout: 20_000 });
-  if (!resp.data || !resp.data.jwtToken) {
-    throw new Error('No se obtuvo jwtToken de HGI');
-  }
+  if (!resp.data || !resp.data.jwtToken) throw new Error('No se obtuvo jwtToken de HGI');
+
   hgiToken = resp.data.jwtToken;
-  // si viene expiración, renueva 60s antes; si no, 10 min por defecto
   const exp = resp.data.passwordExpiration ? Date.parse(resp.data.passwordExpiration) : now + 10 * 60 * 1000;
   hgiExpiresAt = Math.max(exp - 60 * 1000, now + 2 * 60 * 1000);
   return hgiToken;
 }
-
-function hgiHeaders(token) {
-  return { Authorization: `Bearer ${token}` };
-}
+const hgiHeaders = (token) => ({ Authorization: `Bearer ${token}` });
 
 // --------------- Util: verificación HMAC Shopify --------------
 function verifyShopifyHmac(rawBody, headerHmac) {
@@ -110,32 +76,34 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 
-// ----------- Shopify: products/update → HGI Productos --------
+// =============================================================
+// ===============  PRODUCTOS (update / delete)  ===============
+// =============================================================
+
+// products/update → HGI Productos/Actualizar
 app.post('/webhook/productos/update', async (req, res) => {
   try {
     if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
       return res.status(401).send('Invalid HMAC');
     }
-    const product = req.body; // payload de Shopify product
+    const product = req.body;
     const active = (product.status || '').toLowerCase() === 'active' ? 1 : 0;
 
-    // Construir lista de productos HGI a partir de variantes con SKU
     const productos = [];
     for (const v of product.variants || []) {
-      if (!v.sku) continue; // solo variantes con SKU
+      if (!v.sku) continue;
       productos.push({
         Codigo: v.sku,
         Descripcion: `${product.title}${v.title && v.title !== 'Default Title' ? ' - ' + v.title : ''}`,
-        Precio: Number(v.price || 0),
-        Estado: active,
-        Ecommerce: 1,
+        Precio1: Number(v.price || 0), // HGI usa Precio1..Precio8
+        Vigente: active,               // 1 activo / 0 inactivo
+        Ecommerce: 1
       });
     }
     if (!productos.length) return res.status(200).send('No SKUs to update');
 
     const token = await getHgiToken();
     const url = `${HGI_BASE_URL}Api/Productos/Actualizar`;
-    // HGI normalmente espera lista; enviamos un array simple
     const r = await axios.put(url, productos, { headers: hgiHeaders(token), timeout: 20_000 });
 
     console.log('[HGI Productos/Actualizar] ok', Array.isArray(r.data) ? r.data.length : '');
@@ -146,7 +114,130 @@ app.post('/webhook/productos/update', async (req, res) => {
   }
 });
 
-// ----------- Shopify: orders/paid → HGI DocContables/Crear ---
+// "Cancelación de producto" (equivalente: products/delete) → marcar inactivo
+app.post('/webhook/productos/delete', async (req, res) => {
+  try {
+    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
+      return res.status(401).send('Invalid HMAC');
+    }
+    const product = req.body;
+
+    const productos = [];
+    // Shopify envía el producto con sus variantes; si no, no pasa nada
+    for (const v of product.variants || []) {
+      if (!v.sku) continue;
+      productos.push({
+        Codigo: v.sku,
+        Vigente: 0,
+        Ecommerce: 0
+      });
+    }
+    if (!productos.length) return res.status(200).send('No SKUs to disable');
+
+    const token = await getHgiToken();
+    const url = `${HGI_BASE_URL}Api/Productos/Actualizar`;
+    await axios.put(url, productos, { headers: hgiHeaders(token), timeout: 20_000 });
+
+    console.log('[HGI Productos/Actualizar] delete→inactivo', productos.length);
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('productos/delete error:', e.response?.data || e.message);
+    return res.status(500).send('Error');
+  }
+});
+
+// =============================================================
+// ===================  PEDIDOS (create/updated) ===============
+// =============================================================
+
+// Helper: crea documento en HGI desde una orden Shopify (si no existe)
+async function createHgiDocFromOrder(order) {
+  const orderId = String(order.id);
+  if (mapStore.orders[orderId]) return 'already';
+
+  const tercero = order?.customer?.email || HGI_TERCERO_DEFAULT || null;
+  const total = Number(order.total_price || 0);
+
+  const documento = {
+    Empresa: Number(HGI_EMPRESA),
+    IdComprobante: HGI_COMPROBANTE,
+    Fecha: order.created_at || new Date().toISOString(),
+    Observaciones: `Shopify order ${orderId}`,
+    ComprobanteDetalle: [
+      {
+        CuentaNIIF: HGI_CUENTA_INGRESO,
+        Detalle: `Venta ${orderId}`,
+        Referencia: orderId,
+        Debito: 0,
+        Credito: total
+      },
+      {
+        CuentaNIIF: HGI_CUENTA_CLIENTE,
+        Detalle: `Cliente ${tercero || 'N/A'}`,
+        Tercero: tercero || undefined,
+        Debito: total,
+        Credito: 0
+      }
+    ]
+  };
+
+  const token = await getHgiToken();
+  const url = `${HGI_BASE_URL}Api/DocumentosContables/Crear`;
+  const r = await axios.post(url, [documento], { headers: hgiHeaders(token), timeout: 20_000 });
+
+  const created = Array.isArray(r.data) ? r.data[0] : r.data?.[0] || r.data;
+  const mapping = {
+    empresa: documento.Empresa,
+    comprobante: documento.IdComprobante,
+    documento: created?.Documento || created?.Id || created?.documento || null,
+  };
+
+  mapStore.orders[orderId] = mapping;
+  saveMap();
+  console.log('[HGI DocContables/Crear] ok', mapping);
+  return mapping;
+}
+
+// orders/create → crea si ya viene pagado; si no, sólo ACK
+app.post('/webhook/orders/create', async (req, res) => {
+  try {
+    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
+      return res.status(401).send('Invalid HMAC');
+    }
+    const order = req.body;
+    if ((order.financial_status || '').toLowerCase() === 'paid') {
+      await createHgiDocFromOrder(order);
+    }
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('orders/create error:', e.response?.data || e.message);
+    return res.status(500).send('Error');
+  }
+});
+
+// orders/updated → si cambia a pagado y no existe, crea
+app.post('/webhook/orders/updated', async (req, res) => {
+  try {
+    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
+      return res.status(401).send('Invalid HMAC');
+    }
+    const order = req.body;
+    const orderId = String(order.id);
+    if ((order.financial_status || '').toLowerCase() === 'paid' && !mapStore.orders[orderId]) {
+      await createHgiDocFromOrder(order);
+    }
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('orders/updated error:', e.response?.data || e.message);
+    return res.status(500).send('Error');
+  }
+});
+
+// =============================================================
+// ======  PEDIDOS (paid / cancelled ya existentes)  ===========
+// =============================================================
+
+// orders/paid → HGI DocContables/Crear
 app.post('/webhook/orders/paid', async (req, res) => {
   try {
     if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
@@ -155,60 +246,10 @@ app.post('/webhook/orders/paid', async (req, res) => {
     const order = req.body;
     const orderId = String(order.id);
 
-    // Idempotencia: si ya existe el mapeo, salir con 200
     if (mapStore.orders[orderId]) {
       return res.status(200).send('Already processed');
     }
-
-    // Tercero: intenta usar email, si no, fallback
-    const tercero = order?.customer?.email || HGI_TERCERO_DEFAULT || null;
-
-    // Total venta (sin impuestos finos, ajustar según tu plan de cuentas)
-    const total = Number(order.total_price || 0);
-
-    const documento = {
-      Empresa: Number(HGI_EMPRESA),
-      IdComprobante: HGI_COMPROBANTE,
-      Fecha: order.created_at || new Date().toISOString(),
-      Observaciones: `Shopify order ${orderId}`,
-      ComprobanteDetalle: [
-        {
-          CuentaNIIF: HGI_CUENTA_INGRESO,
-          Detalle: `Venta ${orderId}`,
-          Referencia: orderId,
-          Debito: 0,
-          Credito: total
-        },
-        {
-          CuentaNIIF: HGI_CUENTA_CLIENTE,
-          Detalle: `Cliente ${tercero || 'N/A'}`,
-          Tercero: tercero || undefined,
-          Debito: total,
-          Credito: 0
-        }
-      ]
-    };
-
-    const token = await getHgiToken();
-    const url = `${HGI_BASE_URL}Api/DocumentosContables/Crear`;
-    const r = await axios.post(url, [documento], { headers: hgiHeaders(token), timeout: 20_000 });
-
-    // Extrae identificador del documento creado
-    const created = Array.isArray(r.data) ? r.data[0] : r.data?.[0] || r.data;
-    const mapping = {
-      empresa: documento.Empresa,
-      comprobante: documento.IdComprobante,
-      documento: created?.Documento || created?.Id || created?.documento || null,
-    };
-
-    if (!mapping.documento) {
-      console.warn('[WARN] No pude leer el número de documento desde la respuesta HGI. Guarda el log.');
-    }
-
-    mapStore.orders[orderId] = mapping;
-    saveMap();
-
-    console.log('[HGI DocContables/Crear] ok', mapping);
+    await createHgiDocFromOrder(order);
     return res.status(200).send('OK');
   } catch (e) {
     console.error('orders/paid error:', e.response?.data || e.message);
@@ -216,7 +257,7 @@ app.post('/webhook/orders/paid', async (req, res) => {
   }
 });
 
-// ----------- Shopify: orders/cancelled → HGI DocContables/Actualizar (Estado=2)
+// orders/cancelled → HGI DocContables/Actualizar (Estado = 2)
 app.post('/webhook/orders/cancelled', async (req, res) => {
   try {
     if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
@@ -227,8 +268,7 @@ app.post('/webhook/orders/cancelled', async (req, res) => {
 
     const mapping = mapStore.orders[orderId];
     if (!mapping) {
-      // No mapeo (tal vez no se facturó). Responder 200 para no reintentar.
-      return res.status(200).send('No mapping');
+      return res.status(200).send('No mapping'); // no se creó en HGI (no reintentar)
     }
 
     const doc = {
