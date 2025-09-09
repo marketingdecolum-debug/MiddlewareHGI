@@ -30,6 +30,7 @@ let hgiExpiresAt = 0; // ms epoch
 async function getHgiToken() {
   const now = Date.now();
   if (hgiToken && now < hgiExpiresAt) return hgiToken;
+
   const params = {
     usuario: HGI_USER,
     clave: HGI_PASS,
@@ -37,14 +38,31 @@ async function getHgiToken() {
     cod_empresa: HGI_EMPRESA,
   };
   const url = `${HGI_BASE_URL}Api/Autenticar`;
-  const resp = await axios.get(url, { params, timeout: 20_000 });
-  if (!resp.data || !resp.data.jwtToken) throw new Error('No se obtuvo jwtToken de HGI');
 
-  hgiToken = resp.data.jwtToken;
-  const exp = resp.data.passwordExpiration ? Date.parse(resp.data.passwordExpiration) : now + 10 * 60 * 1000;
+  const resp = await axios.get(url, { params, timeout: 20_000 });
+  const data = resp.data || {};
+
+  // Si HGI devolvió un objeto Error, aborta con el detalle
+  if (data.Error) {
+    console.error('[HGI Autenticar] Error:', data.Error);
+    throw new Error(data.Error?.Mensaje || 'HGI Autenticar devolvió Error');
+  }
+
+  // HGI suele devolver "JwtToken" y "PasswordExpiration" (con mayúsculas)
+  const jwt = data.JwtToken || data.jwtToken;
+  if (!jwt) {
+    console.error('[HGI Autenticar] Respuesta inesperada:', JSON.stringify(data));
+    throw new Error('No se obtuvo JwtToken de HGI');
+  }
+  hgiToken = jwt;
+
+  const expStr = data.PasswordExpiration || data.passwordExpiration;
+  const exp = expStr ? Date.parse(expStr) : (now + 10 * 60 * 1000);
   hgiExpiresAt = Math.max(exp - 60 * 1000, now + 2 * 60 * 1000);
+
   return hgiToken;
 }
+
 const hgiHeaders = (token) => ({ Authorization: `Bearer ${token}` });
 
 // --------------- Util: verificación HMAC Shopify --------------
