@@ -23,6 +23,62 @@ if (!HGI_BASE_URL || !HGI_USER || !HGI_PASS || !HGI_COMPANY || !HGI_EMPRESA) {
   console.error('[ERROR] Variables HGI incompletas. Revisa .env');
 }
 
+// ---------- Shopify Admin API client ----------
+const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2024-07';
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID; // numérico
+
+const shopify = axios.create({
+  baseURL: `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}`,
+  headers: { 'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN }
+});
+
+// GraphQL helper
+async function shopifyGQL(query, variables = {}) {
+  const r = await shopify.post('/graphql.json', { query, variables });
+  if (r.data.errors) throw new Error(JSON.stringify(r.data.errors));
+  return r.data.data;
+}
+
+// Busca variante por SKU → devuelve { variantId, inventoryItemId }
+async function findVariantBySKU(sku) {
+  const query = `
+    query($q:String!) {
+      productVariants(first:1, query:$q) {
+        edges { node { id sku inventoryItem { id } } }
+      }
+    }`;
+  const data = await shopifyGQL(query, { q: `sku:${JSON.stringify(sku)}` });
+  const node = data?.productVariants?.edges?.[0]?.node;
+  if (!node) return null;
+  return { variantId: node.id, inventoryItemId: node.inventoryItem.id };
+}
+
+// Actualiza precio de una variante (REST)
+async function setVariantPrice(variantId, price) {
+  const id = variantId.split('/').pop(); // GID -> numérico
+  await shopify.put(`/variants/${id}.json`, { variant: { id, price: Number(price) } });
+}
+
+// Fija stock "on hand" (GraphQL)
+async function setOnHand(inventoryItemId, qty) {
+  const locationGID = `gid://shopify/Location/${SHOPIFY_LOCATION_ID}`;
+  const mutation = `
+    mutation($input: InventorySetOnHandQuantitiesInput!) {
+      inventorySetOnHandQuantities(input: $input) {
+        userErrors { field message }
+      }
+    }`;
+  const input = {
+    reason: "correction",
+    setQuantities: [{ inventoryItemId, locationId: locationGID, quantity: Number(qty) }]
+  };
+  const res = await shopifyGQL(mutation, { input });
+  const errs = res?.inventorySetOnHandQuantities?.userErrors;
+  if (errs && errs.length) throw new Error(JSON.stringify(errs));
+}
+
 // --------------------- Token cache (JWT) ---------------------
 let hgiToken = null;
 let hgiExpiresAt = 0; // ms epoch
@@ -306,6 +362,68 @@ app.post('/webhook/orders/cancelled', async (req, res) => {
   } catch (e) {
     console.error('orders/cancelled error:', e.response?.data || e.message);
     return res.status(500).send('Error');
+  }
+});
+
+// Job: trae cambios desde HGI y actualiza Shopify
+app.get('/jobs/sync-hgi-to-shopify', async (req, res) => {
+  if (process.env.DRY_RUN === 'true') return res.send('DRY_RUN');
+  const sinceMinutes = Number(req.query.since || 30);
+  const since = new Date(Date.now() - sinceMinutes * 60 * 1000).toISOString();
+
+  try {
+    const token = await getHgiToken();
+
+    // 1) Productos cambiados (precio/estado)
+    const urlProd = `${HGI_BASE_URL}Api/Productos/ObtenerLista`;
+    const r1 = await axios.get(urlProd, {
+      headers: hgiHeaders(token),
+      params: {
+        ecommerce: '*', estado: '*', kardex: '*',
+        incluir_foto: false,
+        fecha_inicial: since,
+        fecha_final: new Date().toISOString()
+      },
+      timeout: 20_000
+    });
+    const productos = Array.isArray(r1.data) ? r1.data : [];
+
+    for (const p of productos) {
+      const sku = p.Codigo || p.codigo || p.sku;
+      if (!sku) continue;
+      const v = await findVariantBySKU(sku);
+      if (!v) { console.warn('[SKU no encontrado en Shopify]', sku); continue; }
+      if (p.Precio1 != null) {
+        await setVariantPrice(v.variantId, p.Precio1);
+      }
+      // Si en tu respuesta viene stock en el mismo endpoint, puedes fijarlo aquí:
+      // if (p.Stock != null) await setOnHand(v.inventoryItemId, p.Stock);
+    }
+
+    // 2) Stock (si HGI lo entrega en otro endpoint)
+    try {
+      const urlStock = `${HGI_BASE_URL}Api/Existencias/Obtener`; // cámbialo si tu manual usa otro
+      const r2 = await axios.get(urlStock, {
+        headers: hgiHeaders(token),
+        params: { fecha_inicial: since, fecha_final: new Date().toISOString() },
+        timeout: 20_000
+      });
+      const existencias = Array.isArray(r2.data) ? r2.data : [];
+      for (const x of existencias) {
+        const sku = x.Codigo || x.SKU;
+        const qty = x.Cantidad ?? x.Disponible;
+        if (sku == null || qty == null) continue;
+        const v = await findVariantBySKU(sku);
+        if (v) await setOnHand(v.inventoryItemId, qty);
+      }
+    } catch (e) {
+      console.warn('[Stock HGI] no disponible o sin cambios:', e.response?.data || e.message);
+    }
+
+    res.send(`OK sync desde ${since}`);
+  } catch (e) {
+    console.error('sync-hgi-to-shopify error:', e.response?.data || e.message);
+    res.status(500).send('Error');
   }
 });
 
