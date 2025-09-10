@@ -80,43 +80,52 @@ async function setOnHand(inventoryItemId, qty) {
 }
 
 // --------------------- Token cache (JWT) ---------------------
+// === HGI auth cache con candado ===
 let hgiToken = null;
-let hgiExpiresAt = 0; // ms epoch
+let hgiExpiresAt = 0;        // epoch ms
+let authPromise = null;      // evita logins concurrentes
 
 async function getHgiToken() {
   const now = Date.now();
   if (hgiToken && now < hgiExpiresAt) return hgiToken;
+  if (authPromise) return authPromise;
 
-  const params = {
-    usuario: HGI_USER,
-    clave: HGI_PASS,
-    cod_compania: HGI_COMPANY,
-    cod_empresa: HGI_EMPRESA,
-  };
-  const url = `${HGI_BASE_URL}Api/Autenticar`;
+  authPromise = (async () => {
+    const url = `${HGI_BASE_URL}Api/Autenticar`;
+    const params = {
+      usuario: HGI_USER,
+      clave: HGI_PASS,
+      cod_compania: HGI_COMPANY,
+      cod_empresa: HGI_EMPRESA,
+    };
+    try {
+      const resp = await axios.get(url, { params, timeout: 20_000 });
+      const data = resp.data || {};
 
-  const resp = await axios.get(url, { params, timeout: 20_000 });
-  const data = resp.data || {};
+      // HGI a veces devuelve Error { Mensaje: ... }
+      if (data.Error) {
+        console.error('[HGI Autenticar] Error:', data.Error);
+        throw new Error(data.Error?.Mensaje || 'HGI Autenticar devolvió Error');
+      }
 
-  // Si HGI devolvió un objeto Error, aborta con el detalle
-  if (data.Error) {
-    console.error('[HGI Autenticar] Error:', data.Error);
-    throw new Error(data.Error?.Mensaje || 'HGI Autenticar devolvió Error');
-  }
+      const jwt = data.JwtToken || data.jwtToken;
+      if (!jwt) {
+        console.error('[HGI Autenticar] Respuesta inesperada:', JSON.stringify(data));
+        throw new Error('No se obtuvo JwtToken de HGI');
+      }
+      hgiToken = jwt;
 
-  // HGI suele devolver "JwtToken" y "PasswordExpiration" (con mayúsculas)
-  const jwt = data.JwtToken || data.jwtToken;
-  if (!jwt) {
-    console.error('[HGI Autenticar] Respuesta inesperada:', JSON.stringify(data));
-    throw new Error('No se obtuvo JwtToken de HGI');
-  }
-  hgiToken = jwt;
+      const expStr = data.PasswordExpiration || data.passwordExpiration;
+      const exp = expStr ? Date.parse(expStr) : (Date.now() + 10 * 60 * 1000);
+      hgiExpiresAt = Math.max(exp - 60 * 1000, Date.now() + 2 * 60 * 1000);
 
-  const expStr = data.PasswordExpiration || data.passwordExpiration;
-  const exp = expStr ? Date.parse(expStr) : (now + 10 * 60 * 1000);
-  hgiExpiresAt = Math.max(exp - 60 * 1000, now + 2 * 60 * 1000);
+      return hgiToken;
+    } finally {
+      authPromise = null; // libera el candado
+    }
+  })();
 
-  return hgiToken;
+  return authPromise;
 }
 
 const hgiHeaders = (token) => ({ Authorization: `Bearer ${token}` });
