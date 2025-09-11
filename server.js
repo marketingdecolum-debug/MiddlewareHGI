@@ -133,9 +133,16 @@ const hgiHeaders = (token) => ({ Authorization: `Bearer ${token}` });
 // --------------- Util: verificación HMAC Shopify --------------
 function verifyShopifyHmac(rawBody, headerHmac) {
   try {
-    const generated = crypto.createHmac('sha256', SHOPIFY_SECRET).update(rawBody).digest('base64');
-    return crypto.timingSafeEqual(Buffer.from(generated), Buffer.from(headerHmac || '', 'utf8'));
-  } catch {
+    const generated = crypto
+      .createHmac('sha256', SHOPIFY_SECRET)
+      .update(rawBody)
+      .digest('base64');
+    const genBuf = Buffer.from(generated, 'base64');
+    const headBuf = Buffer.from(headerHmac || '', 'base64');
+    if (genBuf.length !== headBuf.length) return false;
+    return crypto.timingSafeEqual(genBuf, headBuf);
+  } catch (e) {
+    console.error('verifyShopifyHmac error:', e);
     return false;
   }
 }
