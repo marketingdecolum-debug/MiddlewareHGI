@@ -157,13 +157,25 @@ function verifyWebhook(req, res, next) {
 // ----------------- Util: storage de mapeos -------------------
 const MAP_PATH = path.join(process.cwd(), 'map.json');
 let mapStore = { orders: {} }; // { orders: { [shopifyOrderId]: { empresa, comprobante, documento } } }
-try {
-  if (fs.existsSync(MAP_PATH)) mapStore = JSON.parse(fs.readFileSync(MAP_PATH, 'utf8'));
-} catch (e) {
-  console.warn('[WARN] No se pudo cargar map.json:', e.message);
+
+async function loadMap() {
+  try {
+    const data = await fs.promises.readFile(MAP_PATH, 'utf8');
+    mapStore = JSON.parse(data);
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.warn('[WARN] No se pudo cargar map.json:', e.message);
+    }
+  }
 }
-function saveMap() {
-  try { fs.writeFileSync(MAP_PATH, JSON.stringify(mapStore, null, 2)); } catch {}
+loadMap();
+
+async function saveMap() {
+  try {
+    await fs.promises.writeFile(MAP_PATH, JSON.stringify(mapStore, null, 2));
+  } catch (e) {
+    console.error('[ERROR] No se pudo guardar map.json:', e.message);
+  }
 }
 
 // ------------------------- App -------------------------------
@@ -290,7 +302,7 @@ async function createHgiDocFromOrder(order) {
   };
 
   mapStore.orders[orderId] = mapping;
-  saveMap();
+  await saveMap();
   console.log('[HGI DocContables/Crear] ok', mapping);
   return mapping;
 }
