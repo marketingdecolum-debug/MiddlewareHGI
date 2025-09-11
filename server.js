@@ -154,6 +154,10 @@ function saveMap() {
 
 // ------------------------- App -------------------------------
 const app = express();
+app.use((req, _res, next) => {
+  console.log(`${req.method} ${req.url}`, req.headers);
+  next();
+});
 // Guardar cuerpo crudo para HMAC
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
