@@ -147,6 +147,13 @@ function verifyShopifyHmac(rawBody, headerHmac) {
   }
 }
 
+function verifyWebhook(req, res, next) {
+  if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
+    return res.status(401).send('Invalid HMAC');
+  }
+  next();
+}
+
 // ----------------- Util: storage de mapeos -------------------
 const MAP_PATH = path.join(process.cwd(), 'map.json');
 let mapStore = { orders: {} }; // { orders: { [shopifyOrderId]: { empresa, comprobante, documento } } }
@@ -170,6 +177,8 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.get('/health', (_req, res) => res.status(200).send('OK'));
 
+app.use('/webhook', verifyWebhook);
+
 // =============================================================
 // ===============  PRODUCTOS (update / delete)  ===============
 // =============================================================
@@ -177,9 +186,6 @@ app.get('/health', (_req, res) => res.status(200).send('OK'));
 // products/update → HGI Productos/Actualizar
 app.post('/webhook/productos/update', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const product = req.body;
     const active = (product.status || '').toLowerCase() === 'active' ? 1 : 0;
 
@@ -211,9 +217,6 @@ app.post('/webhook/productos/update', async (req, res) => {
 // "Cancelación de producto" (equivalente: products/delete) → marcar inactivo
 app.post('/webhook/productos/delete', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const product = req.body;
 
     const productos = [];
@@ -295,9 +298,6 @@ async function createHgiDocFromOrder(order) {
 // orders/create → crea si ya viene pagado; si no, sólo ACK
 app.post('/webhook/orders/create', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const order = req.body;
     if ((order.financial_status || '').toLowerCase() === 'paid') {
       await createHgiDocFromOrder(order);
@@ -312,9 +312,6 @@ app.post('/webhook/orders/create', async (req, res) => {
 // orders/updated → si cambia a pagado y no existe, crea
 app.post('/webhook/orders/updated', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const order = req.body;
     const orderId = String(order.id);
     if ((order.financial_status || '').toLowerCase() === 'paid' && !mapStore.orders[orderId]) {
@@ -334,9 +331,6 @@ app.post('/webhook/orders/updated', async (req, res) => {
 // orders/paid → HGI DocContables/Crear
 app.post('/webhook/orders/paid', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const order = req.body;
     const orderId = String(order.id);
 
@@ -354,9 +348,6 @@ app.post('/webhook/orders/paid', async (req, res) => {
 // orders/cancelled → HGI DocContables/Actualizar (Estado = 2)
 app.post('/webhook/orders/cancelled', async (req, res) => {
   try {
-    if (!verifyShopifyHmac(req.rawBody, req.get('X-Shopify-Hmac-Sha256'))) {
-      return res.status(401).send('Invalid HMAC');
-    }
     const order = req.body;
     const orderId = String(order.id);
 
