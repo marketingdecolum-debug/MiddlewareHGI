@@ -169,7 +169,6 @@ async function loadMap() {
     }
   }
 }
-loadMap();
 
 async function saveMap() {
   try {
@@ -452,6 +451,9 @@ app.get('/jobs/sync-hgi-to-shopify', async (req, res) => {
 });
 
 // ------------------- Start server ----------------------------
-app.listen(PORT, () => {
-  console.log(`Middleware Shopify⇄HGI escuchando en :${PORT}`);
-});
+async function start() {
+  await loadMap();
+  app.listen(PORT, () => console.log(`Middleware Shopify⇄HGI escuchando en :${PORT}`));
+}
+
+start().catch(console.error);
