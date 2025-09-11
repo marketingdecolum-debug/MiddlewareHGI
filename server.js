@@ -21,6 +21,7 @@ const HGI_TERCERO_DEFAULT = process.env.HGI_TERCERO_DEFAULT || '';
 if (!SHOPIFY_SECRET) console.warn('[WARN] SHOPIFY_SECRET vacío. No podrás validar HMAC.');
 if (!HGI_BASE_URL || !HGI_USER || !HGI_PASS || !HGI_COMPANY || !HGI_EMPRESA) {
   console.error('[ERROR] Variables HGI incompletas. Revisa .env');
+  throw new Error('Variables HGI incompletas. No se puede continuar.');
 }
 
 // ---------- Shopify Admin API client ----------
